@@ -28,6 +28,7 @@ import (
 	exutil "github.com/openshift/origin/test/extended/util"
 	ini "gopkg.in/ini.v1"
 	v1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/types"
@@ -125,6 +126,9 @@ var _ = g.Describe("[OTP][sig-installer][Suite:openshift/openstack][lb][Serial] 
 				svcPort := int32(8082)
 				jig := e2eservice.NewTestJig(clientSet, oc.Namespace(), svcName)
 				jig.Labels = labels
+				// Amphora LBs are costly (slots / max-shared-lb). Register before create so a
+				// timed-out ensure still tears down any partial Octavia LB for the next serial [lb] case.
+				registerAmphoraLoadBalancerTeardown(loadBalancerClient, clientSet, oc.Namespace(), svcName, lbProviderUnderTest)
 				svc, err := jig.CreateLoadBalancerService(ctx, loadBalancerServiceTimeout, func(svc *v1.Service) {
 					svc.Spec.Ports = []v1.ServicePort{{Protocol: protocolUnderTest, Port: svcPort, TargetPort: intstr.FromInt(8081)}}
 					svc.Spec.Selector = labels
@@ -414,6 +418,7 @@ var _ = g.Describe("[OTP][sig-installer][Suite:openshift/openstack][lb][Serial] 
 				monitorMaxRetries := 2
 				jig := e2eservice.NewTestJig(clientSet, oc.Namespace(), svcName)
 				jig.Labels = labels
+				registerAmphoraLoadBalancerTeardown(loadBalancerClient, clientSet, oc.Namespace(), svcName, lbProviderUnderTest)
 				svc, err := jig.CreateLoadBalancerService(ctx, loadBalancerServiceTimeout, func(svc *v1.Service) {
 					svc.Spec.Ports = []v1.ServicePort{{Protocol: protocolUnderTest, Port: svcPort, TargetPort: intstr.FromInt(8081)}}
 					svc.Spec.Selector = labels
@@ -659,8 +664,10 @@ var _ = g.Describe("[OTP][sig-installer][Suite:openshift/openstack][lb][Serial] 
 			o.Expect(err).NotTo(o.HaveOccurred())
 
 			g.By(fmt.Sprintf("Creating Openshift LoadBalancer Service with loadBalancerSourceRanges: '%s'", allowed_sourcerange))
-			jig := e2eservice.NewTestJig(clientSet, oc.Namespace(), "udp-lb-sourceranges-svc")
+			svcName := "udp-lb-sourceranges-svc"
+			jig := e2eservice.NewTestJig(clientSet, oc.Namespace(), svcName)
 			jig.Labels = labels
+			registerAmphoraLoadBalancerTeardown(loadBalancerClient, clientSet, oc.Namespace(), svcName, lbProviderUnderTest)
 			svc, err := jig.CreateLoadBalancerService(ctx, loadBalancerServiceTimeout, func(svc *v1.Service) {
 				svc.Spec.Ports = []v1.ServicePort{{Protocol: v1.ProtocolUDP, Port: svcPort, TargetPort: intstr.FromInt(8081)}}
 				svc.Spec.Selector = labels
@@ -796,6 +803,60 @@ func skipIfNotLbProvider(expectedLbProvider string, ini *ini.File) {
 	if foundLbProvider != strings.ToLower(expectedLbProvider) {
 		e2eskipper.Skipf("Test not applicable for LoadBalancer provider different than %s. Cluster is configured with %q", expectedLbProvider, foundLbProvider)
 	}
+}
+
+// registerAmphoraLoadBalancerTeardown registers best-effort per-spec cleanup for Amphora-backed
+// LoadBalancer Services. Serial [lb] Amphora cases that leave Octavia LBs behind starve later
+// specs (max-shared-lb / amphora capacity), which showed up as ensure-LB timeouts and UDP
+// sourceRanges connectivity flakes in osp_verification. OVN variants are unchanged.
+func registerAmphoraLoadBalancerTeardown(loadBalancerClient *gophercloud.ServiceClient, clientSet *kubernetes.Clientset, namespace, svcName, lbProviderUnderTest string) {
+	if !strings.EqualFold(lbProviderUnderTest, "Amphora") {
+		return
+	}
+	g.DeferCleanup(func(ctx context.Context) {
+		cleanupAmphoraLoadBalancerService(ctx, loadBalancerClient, clientSet, namespace, svcName)
+	})
+}
+
+// cleanupAmphoraLoadBalancerService deletes the Service (so OCCM can release the LB) and, if the
+// Octavia load balancer is still present, cascade-deletes it. Errors are logged only so teardown
+// does not mask the original spec result.
+func cleanupAmphoraLoadBalancerService(ctx context.Context, loadBalancerClient *gophercloud.ServiceClient, clientSet *kubernetes.Clientset, namespace, svcName string) {
+	g.By(fmt.Sprintf("Teardown: Amphora LoadBalancer leftovers for service %s/%s", namespace, svcName))
+
+	lbID := ""
+	svc, err := clientSet.CoreV1().Services(namespace).Get(ctx, svcName, metav1.GetOptions{})
+	if err == nil {
+		lbID = svc.GetAnnotations()["loadbalancer.openstack.org/load-balancer-id"]
+		if delErr := clientSet.CoreV1().Services(namespace).Delete(ctx, svcName, metav1.DeleteOptions{}); delErr != nil && !apierrors.IsNotFound(delErr) {
+			e2e.Logf("Teardown: error deleting service %s/%s: %v", namespace, svcName, delErr)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		e2e.Logf("Teardown: error getting service %s/%s: %v", namespace, svcName, err)
+	}
+
+	if lbID == "" {
+		e2e.Logf("Teardown: no load-balancer-id for %s/%s; nothing to force-delete in Octavia", namespace, svcName)
+		return
+	}
+
+	deadline := time.Now().Add(3 * time.Minute)
+	for time.Now().Before(deadline) {
+		_, getErr := octavialoadbalancers.Get(ctx, loadBalancerClient, lbID).Extract()
+		if getErr != nil {
+			if gophercloud.ResponseCodeIs(getErr, http.StatusNotFound) {
+				e2e.Logf("Teardown: Octavia LB %s is gone", lbID)
+				return
+			}
+			e2e.Logf("Teardown: error getting Octavia LB %s: %v", lbID, getErr)
+		}
+		delErr := octavialoadbalancers.Delete(ctx, loadBalancerClient, lbID, octavialoadbalancers.DeleteOpts{Cascade: true}).ExtractErr()
+		if delErr != nil && !gophercloud.ResponseCodeIs(delErr, http.StatusNotFound) {
+			e2e.Logf("Teardown: cascade delete of Octavia LB %s: %v", lbID, delErr)
+		}
+		time.Sleep(5 * time.Second)
+	}
+	e2e.Logf("Teardown: timed out waiting for Octavia LB %s to disappear", lbID)
 }
 
 // Return the FloatingIP assigned to a provided IP and return error if it is not found.
